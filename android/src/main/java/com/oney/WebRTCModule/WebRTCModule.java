@@ -1,6 +1,7 @@
 package com.oney.WebRTCModule;
 
 import androidx.annotation.Nullable;
+
 import android.util.Log;
 import android.util.SparseArray;
 
@@ -10,6 +11,8 @@ import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.bridge.WritableArray;
+import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.ReadableMapKeySetIterator;
@@ -22,6 +25,19 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+
+import android.util.Base64;
+import android.util.SparseArray;
+import android.hardware.Camera;
+import android.content.Context;
+import android.app.Activity;
+
+import android.opengl.EGLContext;
+import android.util.Log;
+import android.hardware.Camera.CameraInfo;
+import android.hardware.Camera.Parameters;
+import android.hardware.Camera.Size;
 
 import org.webrtc.*;
 import org.webrtc.audio.AudioDeviceModule;
@@ -41,6 +57,8 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         private VideoEncoderFactory videoEncoderFactory = null;
         private VideoDecoderFactory videoDecoderFactory = null;
         private AudioDeviceModule audioDeviceModule = null;
+        private Loggable injectableLogger = null;
+        private Logging.Severity loggingSeverity = null;
 
         public Options() {}
 
@@ -54,6 +72,14 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
 
         public void setVideoEncoderFactory(VideoEncoderFactory videoEncoderFactory) {
             this.videoEncoderFactory = videoEncoderFactory;
+        }
+
+        public void setInjectableLogger(Loggable logger) {
+            this.injectableLogger = logger;
+        }
+
+        public void setLoggingSeverity(Logging.Severity severity) {
+            this.loggingSeverity = severity;
         }
     }
 
@@ -76,19 +102,24 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
     private void initAsync(Options options) {
         ReactApplicationContext reactContext = getReactApplicationContext();
 
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(reactContext)
-                .createInitializationOptions());
-
         AudioDeviceModule adm = null;
         VideoEncoderFactory encoderFactory = null;
         VideoDecoderFactory decoderFactory = null;
+        Loggable injectableLogger = null;
+        Logging.Severity loggingSeverity = null;
 
         if (options != null) {
             adm = options.audioDeviceModule;
             encoderFactory = options.videoEncoderFactory;
             decoderFactory = options.videoDecoderFactory;
+            injectableLogger = options.injectableLogger;
+            loggingSeverity = options.loggingSeverity;
         }
+
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory.InitializationOptions.builder(reactContext)
+                .setInjectableLogger(injectableLogger, loggingSeverity)
+                .createInitializationOptions());
 
         if (encoderFactory == null || decoderFactory == null) {
             // Initialize EGL context required for HW acceleration.
@@ -188,18 +219,37 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
 
     private PeerConnection.RTCConfiguration parseRTCConfiguration(ReadableMap map) {
         ReadableArray iceServersArray = null;
-        if (map != null) {
+        if (map != null && map.hasKey("iceServers")) {
             iceServersArray = map.getArray("iceServers");
         }
         List<PeerConnection.IceServer> iceServers = createIceServers(iceServersArray);
+        PeerConnection.RTCConfiguration configuration = new PeerConnection.RTCConfiguration(iceServers);
+        // TODO: Implement the rest of the RTCConfigure options ...
+        return configuration;
+    }
+
+    @ReactMethod
+    public void peerConnectionInit(ReadableMap configuration, int id){
+        PeerConnection.RTCConfiguration config = parseRTCConfiguration(configuration);
+        PeerConnectionObserver observer = new PeerConnectionObserver(this, id);
+        PeerConnection peerConnection = mFactory.createPeerConnection(config, pcConstraints, observer);
+        observer.setPeerConnection(peerConnection);
+        mPeerConnectionObservers.put(id, observer);
+    }
+
+    private String getNextStreamUUID() {
+        String uuid;
+
+        do {
+            uuid = UUID.randomUUID().toString();
+        } while (mMediaStreams.containsKey(uuid));
         PeerConnection.RTCConfiguration conf = new PeerConnection.RTCConfiguration(iceServers);
         if (map == null) {
             return conf;
         }
 
         // iceTransportPolicy (public api)
-        if (map.hasKey("iceTransportPolicy")
-                && map.getType("iceTransportPolicy") == ReadableType.String) {
+        if (map.hasKey("iceTransportPolicy") && map.getType("iceTransportPolicy") == ReadableType.String) {
             final String v = map.getString("iceTransportPolicy");
             if (v != null) {
                 switch (v) {
@@ -868,20 +918,19 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
-    public void peerConnectionGetStats(String trackId, int id, Callback cb) {
+    public void peerConnectionGetStats(int peerConnectionId, Promise promise) {
         ThreadUtils.runOnExecutor(() ->
-            peerConnectionGetStatsAsync(trackId, id, cb));
+            peerConnectionGetStatsAsync(peerConnectionId, promise));
     }
 
-    private void peerConnectionGetStatsAsync(String trackId,
-                                             int id,
-                                             Callback cb) {
-        PeerConnectionObserver pco = mPeerConnectionObservers.get(id);
+    private void peerConnectionGetStatsAsync(int peerConnectionId,
+                                             Promise promise) {
+        PeerConnectionObserver pco = mPeerConnectionObservers.get(peerConnectionId);
         if (pco == null || pco.getPeerConnection() == null) {
             Log.d(TAG, "peerConnectionGetStats() peerConnection is null");
-            cb.invoke(false, "PeerConnection ID not found");
+            promise.reject(new Exception("PeerConnection ID not found"));
         } else {
-            pco.getStats(trackId, cb);
+            pco.getStats(promise);
         }
     }
 
@@ -901,6 +950,21 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
+    public void mediaStreamRelease(final String id) {
+        MediaStream mediaStream = mMediaStreams.get(id);
+        if (mediaStream != null) {
+            for (VideoTrack track : mediaStream.videoTracks) {
+                mMediaStreamTracks.remove(track);
+                removeVideoCapturer(track.id());
+            }
+            for (AudioTrack track : mediaStream.audioTracks) {
+                mMediaStreamTracks.remove(track);
+            }
+
+            mMediaStreams.remove(id);
+        } else {
+            Log.d(TAG, "mediaStreamRelease() mediaStream is null");
+        }
     public void createDataChannel(int peerConnectionId,
                                   String label,
                                   ReadableMap config) {
